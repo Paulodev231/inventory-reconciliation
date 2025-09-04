@@ -1,0 +1,345 @@
+{
+    "name": "Inventory Reconciliation & Replenishment Signal",
+    "nodes": [
+      {
+        "parameters": {
+          "triggerTimes": {
+            "item": [
+              {
+                "hour": "03",
+                "minute": "00"
+              }
+            ]
+          }
+        },
+        "name": "Cron (daily)",
+        "type": "n8n-nodes-base.cron",
+        "typeVersion": 1,
+        "position": [200, 250]
+      },
+      {
+        "parameters": {
+          "requestMethod": "GET",
+          "url": "={{$env.ERP_API_URL}}/inventory/snapshot",
+          "options": {},
+          "headers": {
+            "Authorization": "Bearer {{$env.ERP_API_TOKEN}}",
+            "Accept": "application/json"
+          }
+        },
+        "name": "ERP — Get Inventory",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 1,
+        "position": [520, 120]
+      },
+      {
+        "parameters": {
+          "requestMethod": "GET",
+          "url": "={{$env.WMS_API_URL}}/inventory",
+          "options": {},
+          "headers": {
+            "Authorization": "Bearer {{$env.WMS_API_TOKEN}}",
+            "Accept": "application/json"
+          }
+        },
+        "name": "WMS — Get Inventory",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 1,
+        "position": [520, 300]
+      },
+      {
+        "parameters": {
+          "requestMethod": "GET",
+          "url": "={{$env.SHOPIFY_API_URL}}/products/inventory",
+          "options": {},
+          "headers": {
+            "X-Shopify-Access-Token": "{{$env.SHOPIFY_TOKEN}}",
+            "Accept": "application/json"
+          }
+        },
+        "name": "Ecom — Get Inventory",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 1,
+        "position": [520, 480]
+      },
+      {
+        "parameters": {
+          "functionCode": "/* Normalize inputs: each incoming node delivers an array of items with sku and qty. Combine into a single payload for reconcile step. */\nconst erp = items[0].json;\nconst wms = items[1].json;\nconst ecom = items[2].json;\n\n// helper to make map: sku -> qty\nfunction makeMap(arr){\n  const m = {};\n  for(const it of arr){\n    const sku = it.sku || it.SKU || it.part || it.item;\n    const q = Number(it.qty || it.quantity || it.on_hand || 0);\n    if(!sku) continue;\n    m[sku] = q;\n  }\n  return m;\n}\nconst mERP = makeMap(Array.isArray(erp)?erp:(erp.items||[]));\nconst mWMS = makeMap(Array.isArray(wms)?wms:(wms.items||[]));\nconst mEcom = makeMap(Array.isArray(ecom)?ecom:(ecom.items||[]));\n\n// union SKUs\nconst skus = Array.from(new Set([...Object.keys(mERP), ...Object.keys(mWMS), ...Object.keys(mEcom)]));\n\nconst out = skus.map(sku=>{\n  const erpQty = mERP[sku]||0;\n  const wmsQty = mWMS[sku]||0;\n  const ecomQty = mEcom[sku]||0;\n  const avgOnHand = Math.round((erpQty + wmsQty + ecomQty)/3);\n  const diff = Math.max(Math.abs(erpQty - wmsQty), Math.abs(erpQty - ecomQty), Math.abs(wmsQty - ecomQty));\n  const reconciliationScore = diff===0?100:Math.max(0, 100 - (diff*10));\n  return { sku, erpQty, wmsQty, ecomQty, avgOnHand, diff, reconciliationScore };\n});\n\nreturn out.map(o=>({json:o}));"
+        },
+        "name": "Function - Reconcile",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 1,
+        "position": [820, 300]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "number": [
+              {
+                "value1": "={{ $json[\"diff\"] }}",
+                "operation": "greaterThan",
+                "value2": "={{ Number($env.RECON_DIFF_THRESHOLD || 5) }} "
+              }
+            ]
+          }
+        },
+        "name": "IF - exception?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 1,
+        "position": [1040, 300]
+      },
+      {
+        "parameters": {
+          "operation": "create",
+          "application": "={{$env.AIRTABLE_APP_ID}}",
+          "table": "Replenishment",
+          "fields": "={\"SKU\": $json.sku, \"ERP_Qty\": $json.erpQty, \"WMS_Qty\": $json.wmsQty, \"Ecom_Qty\": $json.ecomQty, \"AvgOnHand\": $json.avgOnHand, \"Diff\": $json.diff, \"RecScore\": $json.reconciliationScore, \"SuggestedQty\": Math.max(0,  Math.ceil(($json.avgOnHand - $json.wmsQty) * 1.2)) }"
+        },
+        "name": "Airtable - Create Replenishment Row",
+        "type": "n8n-nodes-base.airtable",
+        "typeVersion": 1,
+        "position": [1280, 160]
+      },
+      {
+        "parameters": {
+          "channel": "={{ $env.SLACK_CHANNEL || '#inventory-alerts' }}",
+          "text": "={{`Reconciliation alert for *${$json.sku}* — ERP:${$json.erpQty} | WMS:${$json.wmsQty} | Ecom:${$json.ecomQty}. Suggested Replenish: ${Math.max(0, Math.ceil(($json.avgOnHand - $json.wmsQty)*1.2))} (score ${$json.reconciliationScore}).`}}"
+        },
+        "name": "Slack — notify buyer",
+        "type": "n8n-nodes-base.slack",
+        "typeVersion": 1,
+        "position": [1280, 340]
+      },
+      {
+        "parameters": {
+          "requestMethod": "POST",
+          "url": "={{$env.ERP_API_URL}}/po/draft",
+          "jsonParameters": true,
+          "bodyParametersJson": "={\"sku\": $json.sku, \"qty\": Math.max(0, Math.ceil(($json.avgOnHand - $json.wmsQty)*1.2)), \"reason\": \"Reconciliation exception: diff="+ " $json.diff" + "\"}",
+          "headers": {
+            "Authorization": "Bearer {{$env.ERP_API_TOKEN}}",
+            "Content-Type": "application/json"
+          }
+        },
+        "name": "ERP — Create PO draft (optional)",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 1,
+        "position": [1280, 520]
+      },
+      {
+        "parameters": {
+          "functionCode": "/* Build CSV report row */\nconst line = `${$json.sku},${$json.erpQty},${$json.wmsQty},${$json.ecomQty},${$json.avgOnHand},${$json.diff},${$json.reconciliationScore}`;\nreturn [{json:{csvLine: line}}];"
+        },
+        "name": "Function - build CSV line",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 1,
+        "position": [820, 520]
+      },
+      {
+        "parameters": {
+          "fileName": "inventory-recon-={{ new Date().toISOString().slice(0,10) }}.csv",
+          "binaryPropertyName": "data",
+          "options": {}
+        },
+        "name": "Write Binary File (local)",
+        "type": "n8n-nodes-base.writeBinaryFile",
+        "typeVersion": 1,
+        "position": [1060, 640]
+      },
+      {
+        "parameters": {
+          "operation": "upload",
+          "fileName": "={{ $binary.data.fileName }}",
+          "binaryData": "data",
+          "options": {}
+        },
+        "name": "SFTP — upload",
+        "type": "n8n-nodes-base.sftp",
+        "typeVersion": 1,
+        "position": [1280, 640]
+      },
+      {
+        "parameters": {
+          "values": {
+            "string": [
+              {
+                "name": "runTimestamp",
+                "value": "={{ new Date().toISOString() }}"
+              },
+              {
+                "name": "summary",
+                "value": "={{`Reconciliation run completed. Exceptions: ${items('IF - exception?').length || 0}`}}"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "name": "Set - audit summary",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 1,
+        "position": [820, 760]
+      },
+      {
+        "parameters": {
+          "requestMethod": "POST",
+          "url": "https://api.smartsheet.com/2.0/sheets/{{$env.SMARTSHEET_AUDIT_SHEET_ID}}/rows",
+          "jsonParameters": true,
+          "bodyParametersJson": "={\"toTop\":false,\"rows\":[{\"cells\":[{ \"columnId\": {{$env.COL_AUDIT_TIMESTAMP}}, \"value\": $json.runTimestamp },{ \"columnId\": {{$env.COL_AUDIT_SUMMARY}}, \"value\": $json.summary }]}]} }"
+        },
+        "name": "Smartsheet - Audit row",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 1,
+        "position": [1060, 760]
+      },
+      {
+        "parameters": {
+          "model": "gpt-3.5-turbo",
+          "temperature": 0.2,
+          "messages": "=[{\"role\":\"system\",\"content\":\"You are a short analytical assistant.\"},{\"role\":\"user\",\"content\":\"Given recent velocity for SKU {{$json.sku}}, comment if current velocity is unusual: ERP:${$json.erpQty}, WMS:${$json.wmsQty}, Ecom:${$json.ecomQty}. Reply 1-2 lines.\"}]"
+        },
+        "name": "OpenAI — velocity probe (optional)",
+        "type": "n8n-nodes-base.openai",
+        "typeVersion": 1,
+        "position": [1040, 440]
+      }
+    ],
+    "connections": {
+      "Cron (daily)": {
+        "main": [
+          [
+            {
+              "node": "ERP — Get Inventory",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "WMS — Get Inventory",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Ecom — Get Inventory",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "ERP — Get Inventory": {
+        "main": [
+          [
+            {
+              "node": "Function - Reconcile",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "WMS — Get Inventory": {
+        "main": [
+          [
+            {
+              "node": "Function - Reconcile",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ecom — Get Inventory": {
+        "main": [
+          [
+            {
+              "node": "Function - Reconcile",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Function - Reconcile": {
+        "main": [
+          [
+            {
+              "node": "IF - exception?",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Function - build CSV line",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Set - audit summary",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF - exception?": {
+        "main": [
+          [
+            {
+              "node": "Airtable - Create Replenishment Row",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Slack — notify buyer",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "ERP — Create PO draft (optional)",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "OpenAI — velocity probe (optional)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Function - build CSV line": {
+        "main": [
+          [
+            {
+              "node": "Write Binary File (local)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Write Binary File (local)": {
+        "main": [
+          [
+            {
+              "node": "SFTP — upload",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Set - audit summary": {
+        "main": [
+          [
+            {
+              "node": "Smartsheet - Audit row",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "active": false,
+    "settings": {}
+  }
+  
